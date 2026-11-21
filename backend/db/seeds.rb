@@ -1,6 +1,8 @@
-# Idempotent demo data for local development: one fully set-up business
-# with an owner/admin/staff/customer account each, a realistic service +
-# availability catalog, and a handful of bookings covering every status.
+# Idempotent demo data for local development: five businesses, each with
+# staff, customers, pets, services, availability, and a booking history
+# covering every status. Paws & Play also keeps a small hand-written demo
+# (the customer@ account) below; the bulk data is generated afterwards
+# from db/seeds/.
 # Safe to run repeatedly (`bin/rails db:seed`) -- every step checks for
 # existing data first rather than assuming a fresh database.
 #
@@ -145,9 +147,47 @@ else
   seed_log("Created demo bookings: 1 pending, 1 accepted, 1 denied, 1 cancelled.")
 end
 
+# --- Additional businesses and bulk data ---------------------------------
+# Paws & Play above stays the small, hand-written demo; this section grows
+# it and four other businesses into a production-sized dataset. See
+# db/seeds/demo_catalog.rb for what each business looks like and
+# db/seeds/demo_business_seeder.rb for how it is generated.
+
+require_relative "seeds/demo_catalog"
+require_relative "seeds/demo_business_seeder"
+
+def find_or_create_demo_business(spec)
+  existing = Business.find_by(slug: spec[:slug])
+  return existing if existing
+
+  result = BusinessSignup.new(
+    business_name: spec[:name], business_slug: spec[:slug], time_zone: spec[:time_zone],
+    owner_email: "owner@#{spec[:domain]}", owner_password: DEMO_PASSWORD
+  ).call
+  raise "Failed to seed business #{spec[:slug]}: #{result.errors&.full_messages}" unless result.success?
+
+  seed_log("Created business '#{result.business.name}' (#{result.business.slug}).")
+  result.business
+end
+
+# bcrypt is deliberately slow; hashing the shared demo password once keeps
+# creating several hundred accounts down to seconds.
+password_digest = BCrypt::Password.create(DEMO_PASSWORD)
+name_pool = DemoCatalog::NamePool.new(Random.new(2026))
+previous_customers = []
+
+DemoCatalog::BUSINESSES.each do |spec|
+  demo_business = find_or_create_demo_business(spec)
+  names = name_pool.take(spec[:employees] + spec[:customers])
+
+  previous_customers = DemoBusinessSeeder.new(
+    business: demo_business, spec: spec, password_digest: password_digest,
+    names: names, shared_customers: previous_customers.last(spec[:shared_customers])
+  ).call
+end
+
 seed_log("Done. Demo credentials (all use password '#{DEMO_PASSWORD}'):")
-seed_log("  Owner:    owner@pawsandplay.example")
-seed_log("  Admin:    admin@pawsandplay.example")
-seed_log("  Staff:    staff@pawsandplay.example")
-seed_log("  Customer: customer@pawsandplay.example")
-seed_log("Business URL slug: paws-and-play")
+DemoCatalog::BUSINESSES.each do |spec|
+  seed_log("  #{spec[:name]} (#{spec[:slug]}): " \
+           "owner@#{spec[:domain]}, admin@#{spec[:domain]}, staff@#{spec[:domain]}, customer@#{spec[:domain]}")
+end
