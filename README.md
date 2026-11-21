@@ -50,9 +50,21 @@ accounts below.
 
 ### Demo credentials
 
-`db:seed` creates one fully set-up business, **Paws & Play Daycare**
-(`paws-and-play`), with an account for every role (password
-`password12345` for all of them):
+`db:seed` creates five fully populated businesses, each with its own
+staff, customers, pets, services, availability, and booking history
+(roughly six weeks back and five weeks ahead, in every booking status).
+Every business has an account for each role at `<role>@<domain>`, all
+with the password `password12345`:
+
+| Business (slug) | Domain | Time zone | Staff | Customers | Bookings |
+|---|---|---|---|---|---|
+| Paws & Play Daycare (`paws-and-play`) | `pawsandplay.example` | New York | 8 | 64 | ~300 |
+| Canine Collegiate (`canine-collegiate`) | `caninecollegiate.example` | New York | 6 | 41 | ~145 |
+| Bark Avenue Boarding (`bark-avenue`) | `barkavenue.example` | New York | 9 | 72 | ~290 |
+| Happy Tails Resort & Spa (`happy-tails-resort`) | `happytails.example` | Chicago | 10 | 80 | ~360 |
+| Sunset Paws Training & Daycare (`sunset-paws`) | `sunsetpaws.example` | Los Angeles | 4 | 30 | ~90 |
+
+For example, for Paws & Play:
 
 | Role | Email |
 |---|---|
@@ -61,10 +73,19 @@ accounts below.
 | Staff | `staff@pawsandplay.example` |
 | Customer | `customer@pawsandplay.example` |
 
-The customer account has two pets and one booking in each status
-(pending, accepted, denied, cancelled); the business has a daycare,
-training, and boarding service with availability slots over the next
-two weeks. `db:seed` is idempotent — safe to run again at any time.
+The remaining staff and customers have generated `first.last@...`
+addresses (same password). Some customers belong to two businesses, so
+cross-tenant isolation can be exercised with real overlapping accounts.
+Bookings are created through the real booking services, so capacity
+limits are respected -- requests that didn't fit were denied.
+
+`customer@pawsandplay.example` additionally keeps the original small demo
+data set (Rex and Biscuit, one booking per status). The generator lives
+in `backend/db/seeds/` (business definitions in `demo_catalog.rb`, logic
+in `demo_business_seeder.rb`) and is deterministic. `db:seed` is
+idempotent -- safe to run again at any time; businesses that already have
+their data are skipped. To regenerate from scratch, use
+`bin/rails db:reset`.
 
 ## Running tests
 
