@@ -1,0 +1,1120 @@
+diff --git a/backend/app/controllers/api/v1/businesses/all_availability_slots_controller.rb b/backend/app/controllers/api/v1/businesses/all_availability_slots_controller.rb
+new file mode 100644
+index 0000000..f48a00f
+--- /dev/null
++++ b/backend/app/controllers/api/v1/businesses/all_availability_slots_controller.rb
+@@ -0,0 +1,56 @@
++module Api
++  module V1
++    module Businesses
++      # Admin-facing, business-wide, filterable and paginated slot list --
++      # distinct from AvailabilitySlotsController (one service's CRUD) and
++      # AvailabilitiesController (customer-facing bookable view).
++      class AllAvailabilitySlotsController < Api::V1::TenantScopedController
++        def index
++          authorize AvailabilitySlot, :index?
++
++          # 404 (not 422/empty) for another business's service, like every
++          # other tenant-scoped lookup.
++          service_offering = Current.business.service_offerings.find(params[:service_id]) if params[:service_id].present?
++          filter = AvailabilitySlotFilter.new(business: Current.business, service_offering: service_offering, params: params)
++          return render_invalid_filters(filter) unless filter.valid?
++
++          scope = filter.scope
++          total_count = scope.count
++          slots = paginate(
++            scope.select(AvailabilitySlotFilter::SELECT_SQL).includes(:service_offering).order(:starts_at, :id)
++          ).to_a
++
++          render json: {
++            time_zone: Current.business.time_zone,
++            total_count: total_count,
++            has_more: page * per_page < total_count,
++            slots: slots.map { |slot| slot_json(slot) }
++          }
++        end
++
++        private
++
++        def render_invalid_filters(filter)
++          render_error(
++            status: :unprocessable_content,
++            code: "validation_failed",
++            message: "The request could not be processed.",
++            details: filter.errors.to_hash
++          )
++        end
++
++        def slot_json(slot)
++          {
++            id: slot.id,
++            starts_at: slot.starts_at,
++            ends_at: slot.ends_at,
++            capacity: slot.capacity,
++            active: slot.active,
++            remaining_capacity: slot.remaining_capacity,
++            service: { id: slot.service_offering.id, name: slot.service_offering.name }
++          }
++        end
++      end
++    end
++  end
++end
+diff --git a/backend/app/services/availability_slot_filter.rb b/backend/app/services/availability_slot_filter.rb
+new file mode 100644
+index 0000000..07e7bab
+--- /dev/null
++++ b/backend/app/services/availability_slot_filter.rb
+@@ -0,0 +1,115 @@
++# Validates the admin availability filters and builds the matching scope
++# (tenant-scoped through `business.availability_slots`). Remaining
++# capacity and the Closed/Full/Limited/Available state are computed in SQL
++# so they can be filtered *before* pagination.
++class AvailabilitySlotFilter
++  include ActiveModel::Validations
++
++  MAX_RANGE_DAYS = 60
++  STATES = %w[closed full limited available].freeze
++  # Must match LOW_CAPACITY_RATIO in frontend/src/lib/availabilityStatus.js.
++  LOW_CAPACITY_RATIO = 0.25
++
++  # Accepted bookings only -- pending requests reserve nothing (ADR 0005).
++  ACCEPTED_COUNTS_JOIN = <<~SQL.squish.freeze
++    LEFT JOIN (
++      SELECT booking_allocations.availability_slot_id, COUNT(*) AS accepted_count
++      FROM booking_allocations
++      INNER JOIN bookings ON bookings.id = booking_allocations.booking_id
++      WHERE bookings.business_id = %<business_id>d AND bookings.status = 'accepted'
++      GROUP BY booking_allocations.availability_slot_id
++    ) accepted_counts ON accepted_counts.availability_slot_id = availability_slots.id
++  SQL
++
++  REMAINING_SQL = "GREATEST(availability_slots.capacity - COALESCE(accepted_counts.accepted_count, 0), 0)".freeze
++  LIMITED_THRESHOLD_SQL = "GREATEST(1, CEIL(availability_slots.capacity * #{LOW_CAPACITY_RATIO}))".freeze
++  SELECT_SQL = "availability_slots.*, #{REMAINING_SQL} AS remaining_capacity".freeze
++
++  STATE_CONDITIONS = {
++    "closed" => "availability_slots.active = FALSE",
++    "full" => "availability_slots.active AND #{REMAINING_SQL} <= 0",
++    "limited" => "availability_slots.active AND #{REMAINING_SQL} > 0 AND #{REMAINING_SQL} <= #{LIMITED_THRESHOLD_SQL}",
++    "available" => "availability_slots.active AND #{REMAINING_SQL} > #{LIMITED_THRESHOLD_SQL}"
++  }.freeze
++
++  validate :dates_are_valid
++  validate :min_remaining_capacity_is_valid
++  validate :state_is_known
++
++  def initialize(business:, service_offering:, params:)
++    @business = business
++    @service_offering = service_offering
++    @raw_from = params[:from].presence
++    @raw_to = params[:to].presence
++    @raw_min_remaining_capacity = params[:min_remaining_capacity].presence
++    @state = params[:availability_state].presence
++  end
++
++  # Call only after `valid?`.
++  def scope
++    scope = @business.availability_slots
++                     .joins(format(ACCEPTED_COUNTS_JOIN, business_id: @business.id))
++                     .where(starts_at: window)
++    scope = scope.where(service_offering_id: @service_offering.id) if @service_offering
++    scope = scope.where("#{REMAINING_SQL} >= ?", @raw_min_remaining_capacity.to_i) if @raw_min_remaining_capacity
++    scope = scope.where(STATE_CONDITIONS.fetch(@state)) if @state
++    scope
++  end
++
++  private
++
++  def from = @from ||= parse_date(@raw_from)
++  def to = @to ||= parse_date(@raw_to)
++
++  def zone = @zone ||= Time.find_zone!(@business.time_zone)
++
++  # Future slots only, in the business's time zone; every request is
++  # bounded to MAX_RANGE_DAYS.
++  def window
++    now = Time.current
++    lower = from ? [ start_of_day(from), now ].max : now
++    upper =
++      if to then end_of_day(to)
++      elsif from then end_of_day(from + MAX_RANGE_DAYS)
++      else now + MAX_RANGE_DAYS.days
++      end
++    lower..upper
++  end
++
++  def start_of_day(date) = zone.local(date.year, date.month, date.day)
++  def end_of_day(date) = start_of_day(date).end_of_day
++
++  def parse_date(value)
++    Date.iso8601(value) if value
++  rescue ArgumentError
++    nil
++  end
++
++  def dates_are_valid
++    errors.add(:from, "must be a valid date (YYYY-MM-DD)") if @raw_from && from.nil?
++    errors.add(:to, "must be a valid date (YYYY-MM-DD)") if @raw_to && to.nil?
++    return if errors.any?
++
++    errors.add(:to, "requires a from date") if to && from.nil?
++    return unless from && to
++
++    if to < from
++      errors.add(:to, "must not be before the from date")
++    elsif (to - from).to_i > MAX_RANGE_DAYS
++      errors.add(:to, "can't be more than #{MAX_RANGE_DAYS} days after the from date")
++    end
++  end
++
++  def min_remaining_capacity_is_valid
++    return if @raw_min_remaining_capacity.nil?
++    return if @raw_min_remaining_capacity.to_s.match?(/\A\d+\z/) && @raw_min_remaining_capacity.to_i >= 1
++
++    errors.add(:min_remaining_capacity, "must be a whole number of 1 or more")
++  end
++
++  def state_is_known
++    return if @state.nil? || STATES.include?(@state)
++
++    errors.add(:availability_state, "must be one of: #{STATES.join(', ')}")
++  end
++end
+diff --git a/backend/config/routes.rb b/backend/config/routes.rb
+index 2f498fd..4a37f24 100644
+--- a/backend/config/routes.rb
++++ b/backend/config/routes.rb
+@@ -14,6 +14,7 @@ Rails.application.routes.draw do
+           resource :customer_registration, only: :create
+           resources :memberships, only: %i[index update destroy]
+           resources :pets, only: %i[index show create update]
++          resources :availability_slots, only: :index, controller: "all_availability_slots"
+           resources :service_offerings, only: %i[index show create update] do
+             resources :availability_slots, only: %i[index show create update]
+             get :availability, on: :member, to: "availabilities#index"
+diff --git a/backend/db/migrate/20261124180000_add_business_starts_at_index_to_availability_slots.rb b/backend/db/migrate/20261124180000_add_business_starts_at_index_to_availability_slots.rb
+new file mode 100644
+index 0000000..14266a2
+--- /dev/null
++++ b/backend/db/migrate/20261124180000_add_business_starts_at_index_to_availability_slots.rb
+@@ -0,0 +1,10 @@
++class AddBusinessStartsAtIndexToAvailabilitySlots < ActiveRecord::Migration[8.1]
++  def change
++    # The existing availability_slots indexes all lead with
++    # service_offering_id, so the business-wide, all-services list
++    # (WHERE business_id = ? AND starts_at BETWEEN ... ORDER BY starts_at, id)
++    # can't use them.
++    add_index :availability_slots, [ :business_id, :starts_at ],
++              name: "index_availability_slots_on_business_id_and_starts_at"
++  end
++end
+diff --git a/backend/spec/requests/api/v1/businesses/all_availability_slots_spec.rb b/backend/spec/requests/api/v1/businesses/all_availability_slots_spec.rb
+new file mode 100644
+index 0000000..b52b4c6
+--- /dev/null
++++ b/backend/spec/requests/api/v1/businesses/all_availability_slots_spec.rb
+@@ -0,0 +1,185 @@
++require "rails_helper"
++
++RSpec.describe "Api::V1::Businesses::AllAvailabilitySlots", type: :request do
++  let!(:business) { create(:business, slug: "paws-and-play", time_zone: "America/New_York") }
++  let!(:member) { create(:user, password: "password123") }
++  let!(:daycare) { create(:service_offering, business: business, name: "Daycare") }
++  let!(:training) { create(:service_offering, business: business, name: "Training") }
++
++  before { create(:membership, business: business, user: member) }
++
++  def login_as(user)
++    post "/api/v1/session", params: { session: { email: user.email, password: "password123" } }
++  end
++
++  def slots_path(params = {})
++    "/api/v1/businesses/paws-and-play/availability_slots?#{params.to_query}"
++  end
++
++  def create_slot(offering, days_out:, **attrs)
++    create(:availability_slot, service_offering: offering, business: offering.business,
++                                starts_at: days_out.days.from_now, ends_at: days_out.days.from_now + 2.hours, **attrs)
++  end
++
++  def accept_into(slot, count)
++    count.times do
++      booking = create(:booking, :accepted, service_offering: slot.service_offering, business: slot.business,
++                                            requested_starts_at: slot.starts_at, requested_ends_at: slot.ends_at)
++      create(:booking_allocation, booking: booking, availability_slot: slot)
++    end
++  end
++
++  def slot_ids = response.parsed_body["slots"].map { |slot| slot["id"] }
++
++  def business_date(days_out) = days_out.days.from_now.in_time_zone(business.time_zone).to_date
++
++  describe "scoping" do
++    it "never returns another business's slots, even when its service id is passed" do
++      other = create(:business, slug: "city-tails")
++      other_offering = create(:service_offering, business: other)
++      create_slot(other_offering, days_out: 1)
++      mine = create_slot(daycare, days_out: 1)
++      login_as(member)
++
++      get slots_path
++      expect(slot_ids).to eq([ mine.id ])
++
++      get slots_path(service_id: other_offering.id)
++      expect(response).to have_http_status(:not_found)
++    end
++
++    it "excludes past slots" do
++      create_slot(daycare, days_out: -1)
++      login_as(member)
++
++      get slots_path
++
++      expect(slot_ids).to be_empty
++    end
++  end
++
++  describe "filters" do
++    it "stacks every filter with AND" do
++      match = create_slot(daycare, days_out: 3, capacity: 10)
++      create_slot(training, days_out: 3, capacity: 10)
++      create_slot(daycare, days_out: 5, capacity: 10)
++      create_slot(daycare, days_out: 2, capacity: 2) # too little remaining capacity
++      login_as(member)
++
++      get slots_path(
++        service_id: daycare.id, from: business_date(2), to: business_date(3),
++        min_remaining_capacity: 5, availability_state: "available"
++      )
++
++      expect(slot_ids).to eq([ match.id ])
++    end
++
++    it "treats the from/to dates as inclusive days in the business's time zone" do
++      zone = ActiveSupport::TimeZone["America/New_York"]
++      day = zone.today + 3
++      late_that_day = create(:availability_slot, service_offering: daycare, business: business,
++                                                  starts_at: zone.local(day.year, day.month, day.day, 23, 30),
++                                                  ends_at: zone.local(day.year, day.month, day.day, 23, 59))
++      create_slot(daycare, days_out: 10)
++      login_as(member)
++
++      get slots_path(from: day.to_s, to: day.to_s)
++
++      expect(slot_ids).to eq([ late_that_day.id ])
++    end
++
++    it "filters by remaining capacity, not total capacity, ignoring pending bookings" do
++      nearly_full = create_slot(daycare, days_out: 1, capacity: 5)
++      accept_into(nearly_full, 4)
++      create(:booking, service_offering: daycare, business: business) # pending: reserves nothing
++      roomy = create_slot(daycare, days_out: 2, capacity: 5)
++      login_as(member)
++
++      get slots_path(min_remaining_capacity: 2)
++
++      expect(slot_ids).to eq([ roomy.id ])
++    end
++
++    it "matches the Closed/Full/Limited/Available thresholds used by the frontend" do
++      closed = create_slot(daycare, days_out: 1, active: false)
++      full = create_slot(daycare, days_out: 2, capacity: 4).tap { |slot| accept_into(slot, 4) }
++      limited = create_slot(daycare, days_out: 3, capacity: 8).tap { |slot| accept_into(slot, 6) } # 2 left <= ceil(8 * 0.25)
++      available = create_slot(daycare, days_out: 4, capacity: 8).tap { |slot| accept_into(slot, 5) } # 3 left > 2
++      login_as(member)
++
++      { "closed" => closed, "full" => full, "limited" => limited, "available" => available }.each do |state, slot|
++        get slots_path(availability_state: state)
++        expect(slot_ids).to eq([ slot.id ]), "expected only the #{state} slot for #{state}"
++      end
++    end
++  end
++
++  describe "validation" do
++    before { login_as(member) }
++
++    it "rejects `to` without `from`" do
++      get slots_path(to: 3.days.from_now.to_date)
++
++      expect(response).to have_http_status(:unprocessable_content)
++      expect(response.parsed_body.dig("error", "details")).to have_key("to")
++    end
++
++    it "rejects `to` before `from`" do
++      get slots_path(from: 5.days.from_now.to_date, to: 2.days.from_now.to_date)
++
++      expect(response).to have_http_status(:unprocessable_content)
++    end
++
++    it "rejects a range longer than 60 days" do
++      get slots_path(from: Date.current, to: 61.days.from_now.to_date)
++
++      expect(response).to have_http_status(:unprocessable_content)
++    end
++
++    it "rejects a min remaining capacity that isn't a whole number >= 1" do
++      [ "0", "-1", "1.5", "abc" ].each do |value|
++        get slots_path(min_remaining_capacity: value)
++
++        expect(response).to have_http_status(:unprocessable_content), "expected #{value.inspect} to be rejected"
++      end
++    end
++
++    it "rejects an unknown availability state" do
++      get slots_path(availability_state: "busy")
++
++      expect(response).to have_http_status(:unprocessable_content)
++    end
++  end
++
++  describe "pagination" do
++    it "orders by starts_at then id and reports has_more / total_count" do
++      slots = Array.new(3) { |i| create_slot(daycare, days_out: i + 1) }
++      login_as(member)
++
++      get slots_path(per_page: 2)
++      body = response.parsed_body
++      expect(slot_ids).to eq(slots.first(2).map(&:id))
++      expect(body).to include("total_count" => 3, "has_more" => true)
++
++      get slots_path(per_page: 2, page: 2)
++      expect(slot_ids).to eq([ slots.last.id ])
++      expect(response.parsed_body).to include("total_count" => 3, "has_more" => false)
++    end
++
++    it "does not issue additional queries per slot" do
++      3.times { |i| create_slot(daycare, days_out: i + 1) }
++      login_as(member)
++
++      count_queries = lambda do
++        count = 0
++        ActiveSupport::Notifications.subscribed(->(*) { count += 1 }, "sql.active_record") { get slots_path }
++        count
++      end
++
++      baseline = count_queries.call
++      5.times { |i| create_slot(training, days_out: i + 10) }
++
++      expect(count_queries.call).to eq(baseline)
++    end
++  end
++end
+diff --git a/docs/openapi.yaml b/docs/openapi.yaml
+index efcd908..37a8bb3 100644
+--- a/docs/openapi.yaml
++++ b/docs/openapi.yaml
+@@ -538,6 +538,69 @@ paths:
+         "422":
+           $ref: "#/components/responses/ValidationFailed"
+ 
++  /businesses/{business_slug}/availability_slots:
++    get:
++      tags: [Availability]
++      summary: List availability slots across every service (filterable, paginated)
++      description: >
++        Admin-facing, business-wide view. Future slots only, always
++        within a 60-day window (`from`/`to` are business-local dates,
++        inclusive; `to` requires `from`; `to` must not be before `from`
++        or more than 60 days after it, else `422`). Ordered by
++        `starts_at, id`. `remaining_capacity` counts accepted bookings
++        only (ADR 0005). Filters combine with AND. An unknown
++        `service_id` (including another business's) is `404`.
++      parameters:
++        - $ref: "#/components/parameters/BusinessSlug"
++        - name: service_id
++          in: query
++          schema: { type: integer }
++        - name: from
++          in: query
++          schema: { type: string, format: date }
++        - name: to
++          in: query
++          schema: { type: string, format: date }
++        - name: min_remaining_capacity
++          in: query
++          description: Whole number >= 1.
++          schema: { type: integer, minimum: 1 }
++        - name: availability_state
++          in: query
++          schema: { type: string, enum: [closed, full, limited, available] }
++        - name: page
++          in: query
++          schema: { type: integer, minimum: 1, default: 1 }
++        - name: per_page
++          in: query
++          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
++      responses:
++        "200":
++          description: OK
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  time_zone: { type: string }
++                  total_count: { type: integer }
++                  has_more: { type: boolean }
++                  slots:
++                    type: array
++                    items:
++                      allOf:
++                        - $ref: "#/components/schemas/AvailabilitySlot"
++                        - type: object
++                          properties:
++                            remaining_capacity: { type: integer }
++                            service:
++                              type: object
++                              properties:
++                                id: { type: integer }
++                                name: { type: string }
++        "422":
++          $ref: "#/components/responses/ValidationFailed"
++
+   /businesses/{business_slug}/service_offerings/{id}/availability:
+     get:
+       tags: [Availability]
+diff --git a/docs/performance.md b/docs/performance.md
+index 8c9562e..9bdea53 100644
+--- a/docs/performance.md
++++ b/docs/performance.md
+@@ -53,6 +53,12 @@ number of bookings ever made against them.
+ 
+ ## Pagination: plain limit/offset, capped
+ 
++The one exception to the plain-array convention below is the admin
++availability list (`GET .../availability_slots`): it filters on computed
++remaining capacity, which the client can't infer from "fewer than
++`per_page` rows", so it returns `{ slots, total_count, has_more }` and
++applies those filters in SQL *before* the limit/offset.
++
+ No cursor-based pagination, no `kaminari`/`will_paginate` dependency —
+ `Paginatable` (`app/controllers/concerns/paginatable.rb`) is a shared
+ `page`/`per_page` concern (default 25, capped at 100) used by every
+@@ -84,6 +90,7 @@ column is *actually* queried together with others:
+ | `bookings(business_id, created_at)` | `GET .../bookings` unfiltered — a 3-column index grouped by `status` first can't serve `ORDER BY created_at` alone efficiently |
+ | `availability_slots(service_offering_id, active, starts_at)` | the customer-facing availability query (`WHERE active = true AND starts_at BETWEEN ...`) |
+ | `availability_slots(service_offering_id, starts_at, ends_at)` (unique) | prevents duplicate slot windows *and* serves the plain management list ordered by `starts_at` |
++| `availability_slots(business_id, starts_at)` | the admin business-wide list (`GET .../availability_slots`), across every service |
+ | `idempotency_records(business_id, user_id, endpoint, key)` (unique) | the actual concurrency guarantee — see [docs/idempotency.md](idempotency.md) |
+ | `memberships(business_id, user_id)` (unique) | tenant membership resolution on every single request |
+ 
+diff --git a/frontend/src/availability/AvailabilityFilters.jsx b/frontend/src/availability/AvailabilityFilters.jsx
+new file mode 100644
+index 0000000..d4d891e
+--- /dev/null
++++ b/frontend/src/availability/AvailabilityFilters.jsx
+@@ -0,0 +1,108 @@
++import { useState } from 'react'
++import PropTypes from 'prop-types'
++import Form from 'react-bootstrap/Form'
++import Button from 'react-bootstrap/Button'
++import Row from 'react-bootstrap/Row'
++import Col from 'react-bootstrap/Col'
++import { AVAILABILITY_STATE_KEYS, availabilityStateLabel } from '../lib/availabilityStatus'
++import { EMPTY_FILTERS, MAX_RANGE_DAYS, addDays, normalizeFilters, validateFilters } from './availabilityFilters'
++
++// Filters are edited locally and only applied on Submit (no request per
++// keystroke). Server-side 422 details for the submitted filters are
++// shown inline too, for anything the client-side checks didn't catch.
++export function AvailabilityFilters({ services, applied, serverErrors = {}, onSubmit, onClear }) {
++  const [ draft, setDraft ] = useState(() => normalizeFilters(applied))
++  const [ clientErrors, setClientErrors ] = useState({})
++  const errors = { ...serverErrors, ...clientErrors }
++
++  function update(field, value) {
++    setDraft((current) => ({ ...current, [field]: value }))
++  }
++
++  function handleSubmit(event) {
++    event.preventDefault()
++    const found = validateFilters(draft)
++    setClientErrors(found)
++    if (Object.keys(found).length === 0) onSubmit(normalizeFilters(draft))
++  }
++
++  function handleClear() {
++    setDraft(EMPTY_FILTERS)
++    setClientErrors({})
++    onClear()
++  }
++
++  return (
++    <Form onSubmit={handleSubmit} noValidate aria-label="Filter availability">
++      <Row className="g-3 align-items-start">
++        <Col md={3}>
++          <Form.Group controlId="availability-filter-service">
++            <Form.Label>Service</Form.Label>
++            <Form.Select value={draft.serviceId} onChange={(event) => update('serviceId', event.target.value)}>
++              <option value="">All services</option>
++              {services.filter((service) => service.active).map((service) => (
++                <option key={service.id} value={service.id}>{service.name}</option>
++              ))}
++            </Form.Select>
++          </Form.Group>
++        </Col>
++        <Col md={2}>
++          <Form.Group controlId="availability-filter-from">
++            <Form.Label>From</Form.Label>
++            <Form.Control type="date" value={draft.from} isInvalid={Boolean(errors.from)}
++                          onChange={(event) => update('from', event.target.value)} />
++            <Form.Control.Feedback type="invalid">{errors.from}</Form.Control.Feedback>
++          </Form.Group>
++        </Col>
++        <Col md={2}>
++          <Form.Group controlId="availability-filter-to">
++            <Form.Label>To</Form.Label>
++            <Form.Control type="date" value={draft.to} isInvalid={Boolean(errors.to)}
++                          min={draft.from || undefined}
++                          max={draft.from ? addDays(draft.from, MAX_RANGE_DAYS) : undefined}
++                          onChange={(event) => update('to', event.target.value)} />
++            <Form.Control.Feedback type="invalid">{errors.to}</Form.Control.Feedback>
++          </Form.Group>
++        </Col>
++        <Col md={2}>
++          <Form.Group controlId="availability-filter-min-capacity">
++            <Form.Label>Min remaining capacity</Form.Label>
++            <Form.Control type="number" min={1} step={1} value={draft.minRemainingCapacity}
++                          isInvalid={Boolean(errors.minRemainingCapacity)}
++                          onChange={(event) => update('minRemainingCapacity', event.target.value)} />
++            <Form.Control.Feedback type="invalid">{errors.minRemainingCapacity}</Form.Control.Feedback>
++          </Form.Group>
++        </Col>
++        <Col md={3}>
++          <Form.Group controlId="availability-filter-state">
++            <Form.Label>Availability</Form.Label>
++            <Form.Select value={draft.state} isInvalid={Boolean(errors.state)}
++                         onChange={(event) => update('state', event.target.value)}>
++              <option value="">Any</option>
++              {AVAILABILITY_STATE_KEYS.map((key) => (
++                <option key={key} value={key}>{availabilityStateLabel(key)}</option>
++              ))}
++            </Form.Select>
++            <Form.Control.Feedback type="invalid">{errors.state}</Form.Control.Feedback>
++          </Form.Group>
++        </Col>
++      </Row>
++      <div className="d-flex gap-2 mt-3">
++        <Button type="submit" variant="primary">Submit</Button>
++        <Button type="button" variant="outline-secondary" onClick={handleClear}>Clear filters</Button>
++      </div>
++    </Form>
++  )
++}
++
++AvailabilityFilters.propTypes = {
++  services: PropTypes.arrayOf(PropTypes.shape({
++    id: PropTypes.number.isRequired,
++    name: PropTypes.string.isRequired,
++    active: PropTypes.bool,
++  })).isRequired,
++  applied: PropTypes.object.isRequired,
++  serverErrors: PropTypes.object,
++  onSubmit: PropTypes.func.isRequired,
++  onClear: PropTypes.func.isRequired,
++}
+diff --git a/frontend/src/availability/AvailabilityOverviewPage.jsx b/frontend/src/availability/AvailabilityOverviewPage.jsx
+index 4c3c673..39ef022 100644
+--- a/frontend/src/availability/AvailabilityOverviewPage.jsx
++++ b/frontend/src/availability/AvailabilityOverviewPage.jsx
+@@ -1,8 +1,13 @@
++import { useState } from 'react'
+ import { Link, useParams } from 'react-router-dom'
+ import Button from 'react-bootstrap/Button'
++import { getApiError } from '../api/client'
+ import { useBusiness } from '../businesses/useBusiness'
+ import { useCurrentMembership } from '../auth/useCurrentMembership'
+-import { useAllAvailabilitySlots } from './useAllAvailabilitySlots'
++import { useServices } from '../services/useServices'
++import { useFilteredAvailabilitySlots } from './useFilteredAvailabilitySlots'
++import { AvailabilityFilters } from './AvailabilityFilters'
++import { EMPTY_FILTERS, isDefaultFilters } from './availabilityFilters'
+ import { PageHeader } from '../components/PageHeader'
+ import { SectionCard } from '../components/SectionCard'
+ import { ResponsiveTable } from '../components/ResponsiveTable'
+@@ -10,81 +15,127 @@ import { StatusBadge } from '../components/StatusBadge'
+ import { EmptyState } from '../components/EmptyState'
+ import { LoadingState } from '../components/LoadingState'
+ import { ErrorAlert } from '../components/ErrorAlert'
++import { availabilityState } from '../lib/availabilityStatus'
+ import { formatDateTimeRange } from '../lib/dateTime'
+ 
+ // A combined, read-only view across every service's slots -- editing a
+ // specific slot still happens on its service's management page (linked
+-// from here), rather than duplicating that form in two places. This
+-// admin-facing endpoint only ever returns a slot's total `capacity` and
+-// `active` flag (not a computed remaining/reserved count -- that's only
+-// available from the customer-facing availability endpoint), so this
+-// table shows total capacity and an Active/Inactive status rather than
+-// an Available/Limited/Full breakdown.
++// from here), rather than duplicating that form in two places. Filtering
++// and paging happen server-side (see useFilteredAvailabilitySlots).
+ export function AvailabilityOverviewPage() {
+   const { businessSlug } = useParams()
+   const { data: business } = useBusiness(businessSlug)
+   const membership = useCurrentMembership()
+   const canManage = Boolean(membership && [ 'owner', 'admin' ].includes(membership.role))
+-  const { services, slots, isLoading, isError } = useAllAvailabilitySlots(businessSlug)
++  const { data: services = [] } = useServices(businessSlug)
++  const [ appliedFilters, setAppliedFilters ] = useState(EMPTY_FILTERS)
+ 
+-  if (isLoading) return <LoadingState label="Loading availability…" />
+-  if (isError) return <ErrorAlert message="Something went wrong loading availability. Please try again." />
++  const {
++    slots, isPending, isError, error, fetchNextPage, hasNextPage, isFetchingNextPage,
++  } = useFilteredAvailabilitySlots(businessSlug, appliedFilters, {
++    role: membership?.role, timeZone: business?.time_zone,
++  })
+ 
+-  const sortedSlots = [ ...slots ].sort((a, b) => new Date(a.starts_at) - new Date(b.starts_at))
++  const apiError = error && getApiError(error)
++  const isInvalidFilters = apiError?.code === 'validation_failed'
++  const serverErrors = isInvalidFilters ? {
++    from: apiError.details.from?.[0],
++    to: apiError.details.to?.[0],
++    minRemainingCapacity: apiError.details.min_remaining_capacity?.[0],
++    state: apiError.details.availability_state?.[0],
++  } : {}
++
++  function clearFilters() {
++    setAppliedFilters(EMPTY_FILTERS)
++  }
+ 
+   return (
+     <>
+       <PageHeader
+         title="Availability"
+-        description="Every scheduled slot across every service, in the business's time zone."
++        description="Upcoming slots across every service, in the business's time zone."
+       />
++      <SectionCard className="mb-4">
++        <AvailabilityFilters
++          key={JSON.stringify(appliedFilters)}
++          services={services}
++          applied={appliedFilters}
++          serverErrors={serverErrors}
++          onSubmit={setAppliedFilters}
++          onClear={clearFilters}
++        />
++      </SectionCard>
++      {isError && !isInvalidFilters && (
++        <ErrorAlert message="Something went wrong loading availability. Please try again." />
++      )}
+       <SectionCard>
+-        {sortedSlots.length === 0 ? (
+-          <EmptyState
+-            title="No availability scheduled yet"
+-            description="Add availability from a service's management page."
+-            action={services[0] && (
+-              <Button as={Link} to={`/${businessSlug}/services/${services[0].id}/slots`} variant="primary">
+-                Manage availability
+-              </Button>
+-            )}
+-          />
++        {isPending ? (
++          <LoadingState label="Loading availability…" />
++        ) : isError ? null : slots.length === 0 ? (
++          isDefaultFilters(appliedFilters) ? (
++            <EmptyState
++              title="No availability scheduled yet"
++              description="Add availability from a service's management page."
++              action={services[0] && (
++                <Button as={Link} to={`/${businessSlug}/services/${services[0].id}/slots`} variant="primary">
++                  Manage availability
++                </Button>
++              )}
++            />
++          ) : (
++            <EmptyState
++              title="No slots match these filters"
++              description="Try widening the date range or removing a filter."
++              action={<Button variant="outline-secondary" onClick={clearFilters}>Clear filters</Button>}
++            />
++          )
+         ) : (
+           <ResponsiveTable>
+             <thead>
+               <tr>
+                 <th scope="col">Service</th>
+                 <th scope="col">Date / time range</th>
+-                <th scope="col">Capacity</th>
++                <th scope="col">Remaining / capacity</th>
+                 <th scope="col">Status</th>
+                 {canManage && <th scope="col" className="text-end">Action</th>}
+               </tr>
+             </thead>
+             <tbody>
+-              {sortedSlots.map((slot) => (
+-                <tr key={slot.id}>
+-                  <td>{slot.service.name}</td>
+-                  <td>{formatDateTimeRange(slot.starts_at, slot.ends_at, business?.time_zone)}</td>
+-                  <td>{slot.capacity}</td>
+-                  <td><StatusBadge label={slot.active ? 'Active' : 'Inactive'} variant={slot.active ? 'success' : 'secondary'} /></td>
+-                  {canManage && (
+-                    <td className="text-end">
+-                      <Button
+-                        as={Link}
+-                        to={`/${businessSlug}/services/${slot.service.id}/slots`}
+-                        size="sm"
+-                        variant="outline-secondary"
+-                      >
+-                        Edit
+-                      </Button>
+-                    </td>
+-                  )}
+-                </tr>
+-              ))}
++              {slots.map((slot) => {
++                const state = availabilityState(slot)
++                return (
++                  <tr key={slot.id}>
++                    <td>{slot.service.name}</td>
++                    <td>{formatDateTimeRange(slot.starts_at, slot.ends_at, business?.time_zone)}</td>
++                    <td>{slot.remaining_capacity} / {slot.capacity}</td>
++                    <td><StatusBadge label={state.label} variant={state.variant} /></td>
++                    {canManage && (
++                      <td className="text-end">
++                        <Button
++                          as={Link}
++                          to={`/${businessSlug}/services/${slot.service.id}/slots`}
++                          size="sm"
++                          variant="outline-secondary"
++                        >
++                          Edit
++                        </Button>
++                      </td>
++                    )}
++                  </tr>
++                )
++              })}
+             </tbody>
+           </ResponsiveTable>
+         )}
+       </SectionCard>
++
++      {hasNextPage && (
++        <div className="mt-3">
++          <Button variant="outline-secondary" onClick={() => fetchNextPage()} disabled={isFetchingNextPage}>
++            {isFetchingNextPage ? 'Loading…' : 'Load more'}
++          </Button>
++        </div>
++      )}
+     </>
+   )
+ }
+diff --git a/frontend/src/availability/availabilityFilters.js b/frontend/src/availability/availabilityFilters.js
+new file mode 100644
+index 0000000..ad28cb7
+--- /dev/null
++++ b/frontend/src/availability/availabilityFilters.js
+@@ -0,0 +1,108 @@
++import { availabilityStateKey } from '../lib/availabilityStatus'
++
++export const MAX_RANGE_DAYS = 60
++
++export const EMPTY_FILTERS = { serviceId: '', from: '', to: '', minRemainingCapacity: '', state: '' }
++
++// Blank and absent values must share one cache key.
++export function normalizeFilters(filters = {}) {
++  return Object.fromEntries(
++    Object.keys(EMPTY_FILTERS).map((key) => [ key, String(filters[key] ?? '').trim() ])
++  )
++}
++
++export function isDefaultFilters(filters) {
++  const normalized = normalizeFilters(filters)
++  return Object.keys(EMPTY_FILTERS).every((key) => normalized[key] === '')
++}
++
++// Dates are plain YYYY-MM-DD strings throughout (business-local calendar
++// days), so they compare correctly as strings.
++export function addDays(dateString, days) {
++  const date = new Date(`${dateString}T00:00:00Z`)
++  date.setUTCDate(date.getUTCDate() + days)
++  return date.toISOString().slice(0, 10)
++}
++
++function daysBetween(from, to) {
++  return Math.round((new Date(`${to}T00:00:00Z`) - new Date(`${from}T00:00:00Z`)) / 86_400_000)
++}
++
++export function localDate(value, timeZone) {
++  return new Intl.DateTimeFormat('en-CA', {
++    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
++  }).format(new Date(value))
++}
++
++// Mirrors AvailabilitySlotFilter's validations so the form can block a
++// bad submit; the server still enforces them for direct API calls.
++export function validateFilters(filters) {
++  const { from, to, minRemainingCapacity } = normalizeFilters(filters)
++  const errors = {}
++
++  if (to && !from) {
++    errors.to = 'Choose a start date before an end date.'
++  } else if (from && to && to < from) {
++    errors.to = 'The end date can\u2019t be before the start date.'
++  } else if (from && to && daysBetween(from, to) > MAX_RANGE_DAYS) {
++    errors.to = `The date range can\u2019t be longer than ${MAX_RANGE_DAYS} days.`
++  }
++
++  if (minRemainingCapacity && (!/^\d+$/.test(minRemainingCapacity) || Number(minRemainingCapacity) < 1)) {
++    errors.minRemainingCapacity = 'Enter a whole number of 1 or more.'
++  }
++
++  return errors
++}
++
++export function toRequestParams(filters) {
++  const { serviceId, from, to, minRemainingCapacity, state } = normalizeFilters(filters)
++  return {
++    ...(serviceId && { service_id: serviceId }),
++    ...(from && { from }),
++    ...(to && { to }),
++    ...(minRemainingCapacity && { min_remaining_capacity: minRemainingCapacity }),
++    ...(state && { availability_state: state }),
++  }
++}
++
++// The business-local day range a filter set covers (always future-only
++// and at most MAX_RANGE_DAYS wide, matching the server).
++export function effectiveWindow(filters, today) {
++  const { from, to } = normalizeFilters(filters)
++  const start = from || today
++  return { from: start, to: to || addDays(start, MAX_RANGE_DAYS) }
++}
++
++// A cached result can answer `next` in memory only if every row `next`
++// could match was already within the cached filter's results.
++export function canServeFrom(cached, next, today) {
++  const c = normalizeFilters(cached)
++  const n = normalizeFilters(next)
++  const cachedWindow = effectiveWindow(c, today)
++  const nextWindow = effectiveWindow(n, today)
++
++  return (
++    (!c.serviceId || c.serviceId === n.serviceId) &&
++    (!c.state || c.state === n.state) &&
++    (!c.minRemainingCapacity || (n.minRemainingCapacity !== '' && Number(n.minRemainingCapacity) >= Number(c.minRemainingCapacity))) &&
++    cachedWindow.from <= nextWindow.from &&
++    nextWindow.to <= cachedWindow.to
++  )
++}
++
++export function filterSlots(slots, filters, { timeZone, today, now = new Date() }) {
++  const { serviceId, minRemainingCapacity, state } = normalizeFilters(filters)
++  const window = effectiveWindow(filters, today)
++
++  return slots.filter((slot) => {
++    const day = localDate(slot.starts_at, timeZone)
++    return (
++      new Date(slot.starts_at) >= now &&
++      day >= window.from && day <= window.to &&
++      (!serviceId || String(slot.service.id) === serviceId) &&
++      (!minRemainingCapacity || slot.remaining_capacity >= Number(minRemainingCapacity)) &&
++      (!state || availabilityStateKey(slot) === state)
++    )
++  })
++}
+diff --git a/frontend/src/availability/availabilityFilters.test.js b/frontend/src/availability/availabilityFilters.test.js
+new file mode 100644
+index 0000000..946f947
+--- /dev/null
++++ b/frontend/src/availability/availabilityFilters.test.js
+@@ -0,0 +1,86 @@
++import { describe, expect, it } from 'vitest'
++import {
++  EMPTY_FILTERS, canServeFrom, filterSlots, normalizeFilters, toRequestParams, validateFilters,
++} from './availabilityFilters'
++
++describe('validateFilters', () => {
++  it('accepts blank filters', () => {
++    expect(validateFilters(EMPTY_FILTERS)).toEqual({})
++  })
++
++  it('requires a from date when a to date is set', () => {
++    expect(validateFilters({ ...EMPTY_FILTERS, to: '2026-12-05' })).toHaveProperty('to')
++  })
++
++  it('rejects a to date before the from date', () => {
++    expect(validateFilters({ ...EMPTY_FILTERS, from: '2026-12-05', to: '2026-12-01' })).toHaveProperty('to')
++  })
++
++  it('rejects ranges longer than 60 days but allows exactly 60', () => {
++    expect(validateFilters({ ...EMPTY_FILTERS, from: '2026-12-01', to: '2027-01-30' })).toEqual({})
++    expect(validateFilters({ ...EMPTY_FILTERS, from: '2026-12-01', to: '2027-01-31' })).toHaveProperty('to')
++  })
++
++  it.each([ '0', '-1', '1.5', 'abc' ])('rejects %s as a min remaining capacity', (value) => {
++    expect(validateFilters({ ...EMPTY_FILTERS, minRemainingCapacity: value })).toHaveProperty('minRemainingCapacity')
++  })
++})
++
++describe('toRequestParams / normalizeFilters', () => {
++  it('omits blank filters so blank and absent share a cache key', () => {
++    expect(normalizeFilters({ from: ' 2026-12-01 ' })).toEqual({ ...EMPTY_FILTERS, from: '2026-12-01' })
++    expect(toRequestParams({ serviceId: '3', state: 'full' })).toEqual({ service_id: '3', availability_state: 'full' })
++  })
++})
++
++describe('canServeFrom', () => {
++  const today = '2026-12-01'
++
++  it('lets a narrower filter be answered by a broader cached one', () => {
++    expect(canServeFrom(EMPTY_FILTERS, { ...EMPTY_FILTERS, serviceId: '3', state: 'full' }, today)).toBe(true)
++    expect(canServeFrom({ ...EMPTY_FILTERS, minRemainingCapacity: '2' }, { ...EMPTY_FILTERS, minRemainingCapacity: '5' }, today)).toBe(true)
++  })
++
++  it('does not let a narrower cached filter answer a broader one', () => {
++    expect(canServeFrom({ ...EMPTY_FILTERS, serviceId: '3' }, EMPTY_FILTERS, today)).toBe(false)
++    expect(canServeFrom({ ...EMPTY_FILTERS, minRemainingCapacity: '5' }, { ...EMPTY_FILTERS, minRemainingCapacity: '2' }, today)).toBe(false)
++    expect(canServeFrom({ ...EMPTY_FILTERS, from: '2026-12-01', to: '2026-12-05' }, EMPTY_FILTERS, today)).toBe(false)
++  })
++
++  it('does not serve a date window that extends past the cached window', () => {
++    expect(canServeFrom(EMPTY_FILTERS, { ...EMPTY_FILTERS, from: '2027-01-15' }, today)).toBe(false)
++  })
++})
++
++describe('filterSlots', () => {
++  const options = { timeZone: 'America/New_York', today: '2026-12-01', now: new Date('2026-12-01T12:00:00Z') }
++  const slot = (id, startsAt, overrides = {}) => ({
++    id, starts_at: startsAt, active: true, capacity: 8, remaining_capacity: 8, service: { id: 1 }, ...overrides,
++  })
++
++  it('uses business-local calendar days, inclusive of the whole to date', () => {
++    // 03:30Z on Dec 6 is still Dec 5 in New York.
++    const lateOnTheFifth = slot(1, '2026-12-06T03:30:00Z')
++    const nextDay = slot(2, '2026-12-06T12:00:00Z')
++
++    const result = filterSlots([ lateOnTheFifth, nextDay ], { ...EMPTY_FILTERS, from: '2026-12-01', to: '2026-12-05' }, options)
++
++    expect(result.map((s) => s.id)).toEqual([ 1 ])
++  })
++
++  it('stacks service, remaining capacity, and state', () => {
++    const slots = [
++      slot(1, '2026-12-03T15:00:00Z'),
++      slot(2, '2026-12-03T16:00:00Z', { service: { id: 2 } }),
++      slot(3, '2026-12-03T17:00:00Z', { remaining_capacity: 1 }),
++    ]
++
++    const result = filterSlots(slots, { ...EMPTY_FILTERS, serviceId: '1', minRemainingCapacity: '2', state: 'available' }, options)
++
++    expect(result.map((s) => s.id)).toEqual([ 1 ])
++  })
++
++  it('drops slots that have already started', () => {
++    expect(filterSlots([ slot(1, '2026-12-01T11:00:00Z') ], EMPTY_FILTERS, options)).toEqual([])
++  })
++})
+diff --git a/frontend/src/availability/useFilteredAvailabilitySlots.js b/frontend/src/availability/useFilteredAvailabilitySlots.js
+new file mode 100644
+index 0000000..ac2a84f
+--- /dev/null
++++ b/frontend/src/availability/useFilteredAvailabilitySlots.js
+@@ -0,0 +1,60 @@
++import { useMemo } from 'react'
++import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query'
++import { client } from '../api/client'
++import { canServeFrom, filterSlots, localDate, normalizeFilters, toRequestParams } from './availabilityFilters'
++
++const PER_PAGE = 25
++const QUERY_KEY = 'availability_slots_filtered'
++
++// Server-filtered, paginated slots for the whole business. The role is
++// part of the key because the cached rows are only ever shown to the
++// membership that fetched them.
++//
++// On a filter change, an already-cached result for a *broader* filter can
++// answer in memory: if that cache was complete (no more pages) no request
++// is sent; if it was partial its filtered rows are shown as a placeholder
++// while the server request -- the source of truth -- replaces them.
++export function useFilteredAvailabilitySlots(businessSlug, filters, { role, timeZone }) {
++  const queryClient = useQueryClient()
++  const normalized = normalizeFilters(filters)
++  const filterKey = JSON.stringify(normalized)
++  const queryKey = [ QUERY_KEY, businessSlug, normalized, role ]
++
++  const cachedAnswer = useMemo(() => {
++    if (!timeZone) return null
++
++    const now = new Date()
++    const today = localDate(now, timeZone)
++    const candidates = queryClient
++      .getQueriesData({ queryKey: [ QUERY_KEY, businessSlug ] })
++      .filter(([ key, data ]) => data && key[3] === role && canServeFrom(key[2], normalized, today))
++      .map(([ , data ]) => data)
++    if (candidates.length === 0) return null
++
++    const complete = candidates.find((data) => !data.pages.at(-1).has_more)
++    const source = complete ?? candidates[0]
++    const slots = filterSlots(source.pages.flatMap((page) => page.slots), normalized, { timeZone, today, now })
++
++    return { complete: Boolean(complete), slots }
++    // eslint-disable-next-line react-hooks/exhaustive-deps -- recompute only when the submitted filters change
++  }, [ businessSlug, role, timeZone, filterKey ])
++
++  const query = useInfiniteQuery({
++    queryKey,
++    queryFn: async ({ pageParam }) => {
++      const { data } = await client.get(`/businesses/${businessSlug}/availability_slots`, {
++        params: { ...toRequestParams(normalized), page: pageParam, per_page: PER_PAGE },
++      })
++      return data
++    },
++    initialPageParam: 1,
++    getNextPageParam: (lastPage, allPages) => (lastPage.has_more ? allPages.length + 1 : undefined),
++    enabled: Boolean(businessSlug && timeZone) && !cachedAnswer?.complete,
++    placeholderData: cachedAnswer && {
++      pages: [ { slots: cachedAnswer.slots, total_count: cachedAnswer.slots.length, has_more: false } ],
++      pageParams: [ 1 ],
++    },
++  })
++
++  return { ...query, slots: query.data?.pages.flatMap((page) => page.slots) ?? [] }
++}
+diff --git a/frontend/src/lib/availabilityStatus.js b/frontend/src/lib/availabilityStatus.js
+index da3e044..19d3ad6 100644
+--- a/frontend/src/lib/availabilityStatus.js
++++ b/frontend/src/lib/availabilityStatus.js
+@@ -2,14 +2,34 @@
+ // derived here, once, from capacity/remaining_capacity/active so every
+ // page (service booking, availability management) agrees on the
+ // thresholds and labels.
++//
++// The availability-state filter on GET .../availability_slots applies the
++// same rule server-side (AvailabilitySlotFilter) -- keep the two in sync.
+ const LOW_CAPACITY_RATIO = 0.25
+ 
+-export function availabilityState(slot) {
+-  if (!slot.active) return { label: 'Closed', variant: 'secondary' }
+-  if (slot.remaining_capacity <= 0) return { label: 'Full', variant: 'danger' }
++const STATES = {
++  closed: { label: 'Closed', variant: 'secondary' },
++  full: { label: 'Full', variant: 'danger' },
++  limited: { label: 'Limited availability', variant: 'warning' },
++  available: { label: 'Available', variant: 'success' },
++}
++
++export const AVAILABILITY_STATE_KEYS = Object.keys(STATES)
++
++export function availabilityStateKey(slot) {
++  if (!slot.active) return 'closed'
++  if (slot.remaining_capacity <= 0) return 'full'
+ 
+   const lowCapacityThreshold = Math.max(1, Math.ceil(slot.capacity * LOW_CAPACITY_RATIO))
+-  if (slot.remaining_capacity <= lowCapacityThreshold) return { label: 'Limited availability', variant: 'warning' }
++  if (slot.remaining_capacity <= lowCapacityThreshold) return 'limited'
+ 
+-  return { label: 'Available', variant: 'success' }
++  return 'available'
++}
++
++export function availabilityStateLabel(key) {
++  return STATES[key].label
++}
++
++export function availabilityState(slot) {
++  return STATES[availabilityStateKey(slot)]
+ }

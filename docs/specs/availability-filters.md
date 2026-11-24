@@ -147,6 +147,7 @@ Requirements:
 8. **Migration:** is a DB migration (new `business_id`-led index) in scope?
 9. **Endpoint path and naming**, and whether the old per-service admin list remains unchanged.
 10. **Test scope:** confirm the testing plan in section 8.
+11. **What the 60-day bound means:** a maximum *range length* (`to - from`, and `from + 60 days` when only `from` is given) or a maximum *distance from today*? Section 3.1 and the "slots more than 60 days out are not reachable" note assume different readings. The suggested code (see [availability-filters-changes.md](availability-filters-changes.md)) implements the range-length reading.
 
 ## 11. Decision log (resolved contradictions from the meeting)
 
